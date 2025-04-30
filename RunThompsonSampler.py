@@ -16,8 +16,18 @@ dfEvents = pd.read_csv("C:/Users/Drew/Desktop/JOB/2024 data/new dataframes/dfEve
 #REWARD_COL = "SleepReward"
 REWARD_COL = "LogStepsReward"
 
+
+#moodColumns = ['LastMoodScore', 'HoursSinceLastMood', 'StepsPastWeek', 'avgSleepSoFar',
+#               'stdDevSleepSoFar', 'MinutesSleepLast24Hours', 'Steps1HourBefore',
+#               'exercisedPast24Hours', 'underslept', 'is_weekend']
+
+#sleepColumns = ['MinutesSleepLast24Hours', 'underslept', 'RHR', 'maxHRPast24Hours',
+#                'stdDevSleepSoFar', 'avgSleepSoFar', 'HoursSinceLastMood', 'is_weekend',
+#                'StepsPastDay']
+
 stepsColumns = ['StepsPastDay', 'Steps1HourBefore', 'is_weekend', 'StepsPastWeek',
                 'StepsPast3Days', 'maxHRPast24Hours', 'RHR', 'HoursSinceLastMood']
+
 
 
 #mainEffects = moodColumns
@@ -42,11 +52,13 @@ cols.insert(3, cols.pop(cols.index('sent')))
 df = df[cols]
 #df prepared
 
+#build the priors
 mu0, Sigma0, sigma2 = build_step_priors(df, featureCols, REWARD_COL)
 
+#train agents
 agents = {}
 for pid, grp in df.groupby("PARTICIPANTIDENTIFIER"):
-    #initialize fresh TS agent with pooled prior
+    #initialize fresh TS agent with global prior
     agent = ThompsonSampling(priorMean = mu0, priorCov = Sigma0, featureNames = featureCols, noiseVariance = 0.1*sigma2, actionType = 'sent')
     for _, row in grp.sort_values("time").iterrows():
         print(row.index.tolist())
@@ -56,35 +68,16 @@ for pid, grp in df.groupby("PARTICIPANTIDENTIFIER"):
         agent.updatePosterior(context, action, reward)
     agents[pid] = agent
     
-# 1. extract prior variances (diagonal of Sigma0)
-prior_vars = np.diag(Sigma0)
 
-# 2. build a summary table
-rows = []
-for pid, agent in agents.items():
-    post_vars = np.diag(agent.currentCov)
-    rows.append({
-        'PARTICIPANTIDENTIFIER': pid,
-        'mean_prior_var':    prior_vars.mean(),
-        'mean_post_var':     post_vars.mean(),
-        'var_ratio':         post_vars.mean() / prior_vars.mean()
-    })
-
-df_summary = pd.DataFrame(rows)
-
-# 3. inspect the results, sorted by how much variance has shrunk
-print(df_summary.sort_values('var_ratio').head(20))
-
-
+#check fraction of sends
 rows = []
 for pid, agent in agents.items():
     grp = df[df["PARTICIPANTIDENTIFIER"] == pid]
     
-    # 1) actual fraction of sends in the data
+    #actual fraction of sends in the data
     actual_frac = grp["sent"].mean()
     
-    # 2) fraction of sends the TS agent would choose
-    #    we pass only the featureCols slice into decide()
+    #fraction of sends the TS agent would choose
     sim_sends = grp.apply(
         lambda row: agent.decide(row[featureCols]),
         axis=1
