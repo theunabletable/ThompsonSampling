@@ -1,5 +1,12 @@
 # -*- coding: utf-8 -*-
 """
+Created on Sun May  4 17:12:08 2025
+
+@author: Drew
+"""
+
+# -*- coding: utf-8 -*-
+"""
 Created on Wed Apr 30 09:38:01 2025
 
 @author: Drew
@@ -9,6 +16,7 @@ from priors import *
 import pandas as pd
 import numpy as np
 from ThompsonSampling import *
+from AgentManager import *
 
 CSV_PATH = "C:/Users/Drew/Desktop/JOB/2024 data/new dataframes/dfEventsThreeMonthsTimezones.csv"
 dfEvents = pd.read_csv(CSV_PATH)
@@ -16,30 +24,18 @@ dfEvents = pd.read_csv(CSV_PATH)
 dfEvents['processedAction'] = False
 dfEvents['processedReward'] = False
 
-#REWARD_COL = "NextMoodScore"
-#REWARD_COL = "SleepReward"
+
 REWARD_COL = "LogStepsReward"
-
-
-#moodColumns = ['LastMoodScore', 'HoursSinceLastMood', 'StepsPastWeek', 'avgSleepSoFar',
-#               'stdDevSleepSoFar', 'MinutesSleepLast24Hours', 'Steps1HourBefore',
-#               'exercisedPast24Hours', 'underslept', 'is_weekend']
-
-#sleepColumns = ['MinutesSleepLast24Hours', 'underslept', 'RHR', 'maxHRPast24Hours',
-#                'stdDevSleepSoFar', 'avgSleepSoFar', 'HoursSinceLastMood', 'is_weekend',
-#                'StepsPastDay']
 
 stepsColumns = ['StepsPastDay', 'Steps1HourBefore', 'is_weekend', 'StepsPastWeek',
                 'StepsPast3Days', 'maxHRPast24Hours', 'RHR', 'HoursSinceLastMood']
 
 
 
-#mainEffects = moodColumns
-#mainEffect = sleepColumns
 mainEffects = stepsColumns
 
 #choose columns to use in df
-df = dfEvents[mainEffects + [REWARD_COL, 'sent', 'PARTICIPANTIDENTIFIER', 'time']]
+df = dfEvents[mainEffects + [REWARD_COL, 'sent', 'PARTICIPANTIDENTIFIER', 'time', 'processedAction', 'processedReward']]
 
 #adds interactions to all mainEffects
 df = add_sent_interactions(df, mainEffects, sent_var = 'sent')
@@ -58,6 +54,39 @@ df = df[cols]
 
 #build the priors
 mu0, Sigma0, sigma2 = build_step_priors(df, featureCols, REWARD_COL)
+
+participants = dfEvents["PARTICIPANTIDENTIFIER"].unique().tolist()
+
+agMgr = AgentManager(
+    participants = participants,
+    mu0 = mu0,
+    Sigma0 = Sigma0,
+    noiseVariance = sigma2,
+    featureCols = featureCols,
+    rewardName = REWARD_COL,
+    dfEvents = df,
+    actionName = 'sent'
+)
+agents = agMgr.agents
+
+agMgr.findDecisions()
+#finds events for which decisions haven't been made yet
+decisions = agMgr.makeDecisions()
+#makes decisions for each of those events, leaving a list of Decision objects
+dfMgr.processDecisions(decisions)
+#need to update the ground-truth dataframe to say that these events have had their decisions processed
+
+#convert the decisions to a dataframe and csv, to be saved on desk, and sent elsewhere for sending
+df_decisions = pd.DataFrame([{
+    "PARTICIPANTIDENTIFIER": d.pid,
+    "time":                  d.time,
+    "action":                d.action,
+    "p_send":                d.p_send,
+} for d in decisions])
+dfDecisions.to_csv(DECISION_OUT_PATH, index = False)
+print(f"Wrote {len(dfDecisions)} decisions to {DECISIONS_OUT_PATH}")
+
+
 
 #train agents
 agents = {}
