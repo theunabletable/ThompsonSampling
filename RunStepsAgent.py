@@ -49,7 +49,7 @@ cols.insert(1, cols.pop(cols.index('time')))
 cols.insert(2, cols.pop(cols.index(REWARD_COL)))
 cols.insert(3, cols.pop(cols.index('sent')))
 
-df = df[cols]
+dfEvents = df[cols]
 #df prepared
 
 #build the priors

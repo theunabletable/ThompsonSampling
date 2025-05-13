@@ -23,6 +23,7 @@ from ThompsonSampling import ThompsonSampling
 import numpy as np
 import pandas as pd
 from Decision import *
+import pickle
 # global constants
 SEND    = 1
 NO_SEND = 0
@@ -34,61 +35,57 @@ class AgentManager:
         mu0: np.ndarray,
         Sigma0: np.ndarray,
         noiseVariance: float,
+        baseFeatureCols: List[str],
+        interactionFeatureCols: List[str],
         featureCols: List[str],
         rewardName: str,
         dfEvents: pd.DataFrame,
-        actionName: str = "sent" #Parameter without a default follows a parameter with a default
+        actionName: str = "sent"
         
     ):
         """
-        Args:
-          participants   : list of PARTICIPANTIDENTIFIER strings
-          mu0            : prior mean vector (length d)
-          Sigma0         : prior covariance matrix (d × d)
-          noiseVariance  : σ², the noise variance
-          featureCols    : list of feature‐column names (len d)
-          rewardName     : name of the reward column
-          actionName     : name of the “sent” column (default 'sent')
+        participants: list of participant IDs
+        mu0, Sigma0: prior mean and covariance
+        noiseVariance: observation noise σ²
+        baseFeatureCols: raw features + intercept
+        interactionFeatureCols: list of sent_* interaction columns
+        featureCols: full design (base + action + interaction)
+        rewardName: name of reward column
+        dfEvents: full events slice (with pid, time, features, action, reward)
+        actionName: column name for action flag (default 'sent')
         """
-        self.featureCols   = featureCols
-        self.rewardName    = rewardName
-        self.actionName    = actionName
-        self.noiseVariance = noiseVariance
-        
-        #ground truth most up-to-date dataframe slice for agents. Is updated externally. Indexed for fast lookup
+        self.baseFeatureCols        = baseFeatureCols
+        self.interactionFeatureCols = interactionFeatureCols
+        self.featureCols            = featureCols
+        self.rewardName             = rewardName
+        self.actionName             = actionName
+        self.noiseVariance          = noiseVariance
+        # events indexed by (pid, time)
         self.dfEvents = dfEvents.set_index(["PARTICIPANTIDENTIFIER","time"])
 
-        # build TS agents for each participant
+        # build samplers
         self.agents: Dict[str, ThompsonSampling] = self._buildAgents(
             participants, mu0, Sigma0
         )
 
-        #buffers for storing decisions & rewards
-        self.decisionsPending :  List[Decision] = []  #awaiting makeDecisions
-        self.decisionsMade :     List[Decision] = []  #action and p_send assign
-        self.decisionsRewarded : List[Decision] = []  #reward filled in
-        self.decisionsUpdated :  List[Decision] = []  #decisions have been used in updates, and can be flagged as processed
-        
     def _buildAgents(
-            self,
-            participants: List[str],
-            mu0: np.ndarray,
-            Sigma0: np.ndarray
-        ) -> Dict[str, ThompsonSampling]:
-            """
-            Create one ThompsonSampling agent per participant,
-            all sharing the same prior (mu0, Sigma0).
-            """
-            agents = {}
-            for pid in participants:
-                agents[pid] = ThompsonSampling(
-                    priorMean     = mu0,
-                    priorCov      = Sigma0,
-                    featureNames  = self.featureCols,
-                    noiseVariance = self.noiseVariance,
-                    actionType    = self.actionName,
-                )
-            return agents
+        self,
+        participants: List[str],
+        mu0: np.ndarray,
+        Sigma0: np.ndarray
+    ) -> Dict[str, ThompsonSampling]:
+        agents = {}
+        for pid in participants:
+            agents[pid] = ThompsonSampling(
+                priorMean               = mu0,
+                priorCov                = Sigma0,
+                baseFeatureNames        = self.baseFeatureCols,
+                interactionFeatureNames = self.interactionFeatureCols,
+                featureNames            = self.featureCols,
+                noiseVariance           = self.noiseVariance,
+                actionType              = self.actionName
+            )
+        return agents
 
 
         
@@ -110,20 +107,6 @@ class AgentManager:
         return keys
 
 
-    def makeDecisions(self) -> List[Decision]:
-        """
-        Consume decisionsPending: sample actions for each Decision,
-        move them to decisionsMade, and return the list of Decisions.
-        """
-        new_decisions: List[Decision] = []
-        for d in self.decisionsPending:
-            agent = self.agents[d.pid]
-            d.action = agent.decide(d.context)
-            d.p_send = agent.probabilityOfSend(d.context)
-            self.decisionsMade.append(d)
-            new_decisions.append(d)
-        self.decisionsPending.clear()
-        return new_decisions
     
     
     def rewardCalculator(self, pid, time, context, action) -> float:
@@ -159,24 +142,44 @@ class AgentManager:
         return rewarded
         
         
-    def updatePosteriors(self):
-        """
-        For each rewarded decision, find its agent and call updatePosterior.
-        Afterwards, clear the decisionsRewarded list.
-        """
-        for d in self.decisionsRewarded:
-            agent = self.agents[d.pid]
-            # d.context: np.ndarray, d.action: int, d.reward: float
-            agent.updatePosterior(d.context, d.action, d.reward)
-            self.decisionsUpdated.append(d)
 
-        # clear out for next week
-        self.decisionsRewarded.clear()
         
     def clearUpdatedDecisions(self):
         self.decisionsUpdated.clear()
         
         
+    def make_decisions(self, df_slice: pd.DataFrame) -> pd.DataFrame:
+        records = []
+        for _, row in df_slice.iterrows():
+            pid    = row['PARTICIPANTIDENTIFIER']
+            time   = row['time']
+            ctx    = row[self.featureCols]
+            agent  = self.agents[pid]
+            action = agent.decide(ctx)
+            p_send = agent.probabilityOfSend(ctx)
+            records.append({'PARTICIPANTIDENTIFIER': pid,
+                            'time': time,
+                            'action': action,
+                            'p_send': p_send})
+        return pd.DataFrame(records)
+
+    def update_posteriors(self, df_train: pd.DataFrame) -> None:
+        """
+        Expects df_train with columns:
+           - 'PARTICIPANTIDENTIFIER'
+           - self.actionName  (e.g. 'sent')
+           - self.rewardName
+           - *all* of self.featureCols (which includes intercept, mains, interactions)
+        """
+        for _, row in df_train.iterrows():
+            pid    = row['PARTICIPANTIDENTIFIER']
+            # *convert* the Series slice into a dict of floats
+            ctx    = {f: float(row[f]) for f in self.featureCols}
+            action = int(row[self.actionName])
+            reward = float(row[self.rewardName])
+            agent  = self.agents[pid]
+            agent.updatePosterior(ctx, action, reward)   
+            
     def setEventsDf(self, newdfEvents: pd.DataFrame) -> None:
         """
         Swap in a fresh slice of the master events table.
@@ -184,3 +187,20 @@ class AgentManager:
         for its find/make/assign/update pipeline.
         """
         self.dfEvents = newdfEvents.set_index(["PARTICIPANTIDENTIFIER","time"])
+        
+
+    def save(self, path: str) -> None:
+        """
+        Serialize this AgentManager (and all its agents) to disk.
+        """
+        with open(path, "wb") as f:
+            pickle.dump(self, f)
+            
+            
+    @classmethod
+    def load(cls, path: str) -> "AgentManager":
+        """
+        Reconstruct an AgentManager from a pickle file.
+        """
+        with open(path, "rb") as f:
+            return pickle.load(f)
