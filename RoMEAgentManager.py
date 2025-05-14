@@ -36,8 +36,9 @@ class RoMEAgentManager(AgentManager):
         #features
         self.baseFeatureCols_d         = baseFeatureCols
         self.interactionFeatureNames_d = interactionFeatureCols
-        self.featureNames_x_d          = featureCols   # this defines p
+        self.featureCols               = featureCols   # this defines p
         self.actionName                = actionName
+        self.rewardName                = rewardName
         
         #core dimensions
         self.participants = participants      #list of participants
@@ -245,8 +246,55 @@ class RoMEAgentManager(AgentManager):
             action,
             self.baseFeatureCols_d,
             self.interactionFeatureNames_d,
-            self.featureNames_x_d,
+            self.featureCols,
             self.actionName,
         )
         return self._construct_phi_vector(x_d, pid)
     
+    def update_posteriors(self, df_batch: pd.DataFrame) -> None:
+        """
+        Update V and b using a batch of logged rows.  Assumes df_batch
+        has at least columns:
+            PARTICIPANTIDENTIFIER,  actionName,  rewardName,
+            and all feature columns needed by _transform_context_to_x_d.
+        Also assumes π (prob_no_send) was logged at decision time in
+            column 'pi_no_send'; if not present we recompute it.
+        """
+        V_add = sparse.csc_matrix(( (1+self.N)*self.p, (1+self.N)*self.p ), dtype=float)
+        b_add = np.zeros( (1+self.N)*self.p )
+        for _, row in df_batch.iterrows():
+            pid    = row['PARTICIPANTIDENTIFIER']
+            action = int(row[self.actionName])           # 0 or 1
+            reward = float(row[self.rewardName])
+    
+            # π_{i,t} (prob NO_SEND).  Prefer logged value, else recompute.
+            if 'pi_no_send' in row:
+                pi_no = float(row['pi_no_send'])
+            else:
+                pi_no = self.agents[pid].probabilityOfSend(row)
+                pi_no = 1.0 - pi_no                      # convert to NO_SEND prob
+    
+            sigma_tilde2 = pi_no * (1.0 - pi_no)         # weight
+            if action == SEND:
+                denom = 1.0 - pi_no
+            else:  # NO_SEND
+                denom = -pi_no                           # (a - π)
+    
+            r_tilde = reward / denom                     # IPW pseudo‑reward
+    
+            #φ vector for the taken action
+            phi = self.make_phi(pid, row, action)        # 1 × d  (CSR)
+    
+            #accumulate
+            V_add += (sigma_tilde2 * (phi.T @ phi)).tocsc()
+            b_add += sigma_tilde2 * r_tilde * phi.T.A.ravel()
+    
+        #update global posterior
+        self.V += V_add
+        self.b += b_add
+        self.V_chol = cholesky(self.V)   # fresh factor
+    
+        self._C_cache.clear()
+        for ag in self.agents.values():
+            ag.currentMean = None        # force refresh
+            ag.currentCov  = None

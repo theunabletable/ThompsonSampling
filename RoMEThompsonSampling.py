@@ -14,7 +14,7 @@ NO_SEND = 0
 SEND = 1
 class RoMEThompsonSampling(ThompsonSampling):
     """
-    A thin wrapper over ThompsonSampling that draws its posterior from a shared RoMEAgentManager.
+    A wrapper over ThompsonSampling that draws its posterior from a shared RoMEAgentManager.
     Each instance holds only a pid and reference to the manager; all heavy lifting stays in the manager.
     """
     def __init__(
@@ -35,7 +35,7 @@ class RoMEThompsonSampling(ThompsonSampling):
         
         base_features = manager.baseFeatureCols_d
         interaction_features = manager.interactionFeatureNames_d
-        feature_names = manager.featureNames_x_d
+        feature_names = manager.featureCols
         action_type = manager.actionName
         
         self.pi_min = 0.2 #minimum no_send probability
@@ -62,13 +62,6 @@ class RoMEThompsonSampling(ThompsonSampling):
         self.currentMean = mu_i
         self.currentCov  = Sigma_i
 
-
-
-    def updatePosterior(self, context, action, reward):
-        """
-        RoME updates happen globally in the manager—prevent individual updates.
-        """
-        raise NotImplementedError("RoMEThompsonSampling updates via its manager, not individually.")
         
     #advantage features are phi(s, i) = phi(s, SEND, i) - phi(s, NO_SEND, i) and is the set of features which are different under send vs no_send
     #advantage mean is the expected treatment effect of sending, and ths variance is needed for the advantage's distribution
