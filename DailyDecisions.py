@@ -9,11 +9,17 @@ import numpy as np
 from priors import build_step_priors
 from AgentManager import AgentManager
 from DataManager import DataManager
+from pathlib import Path
 import os
 from config import *
 from utils import *
 
 run_date = pd.Timestamp(date(2024, 7, 9), tz="UTC")
+
+base_dir  = Path(r"C:\Users\Drew\Desktop\JOB\ThompsonSampling\Data\decisions")
+date_str  = run_date.strftime("%Y-%m-%d")               # "2024-07-09"
+daily_dir = base_dir / date_str                         # ".../decisions/2024-07-09"
+daily_dir.mkdir(parents=True, exist_ok=True)            # make it (and parents) if needed
 
 #prepare each day's slice
 steps_slice = prepare_day_slice(run_date, STEP_MAIN_COLS, STEP_INTERACTION_COLS, action_col = ACTION_COL)
@@ -33,12 +39,8 @@ for setting, mgr, df_slice in [
     ("mood",  moodMgr,  mood_slice),
 ]:
     mgr.setEventsDf(df_slice)
-    #mgr.findDecisions()
-    #decs = mgr.makeDecisions()
-    print(df_slice.columns.tolist())
     df_decisions = mgr.make_decisions(df_slice)
-    # Write out per-agent
-    #out = pd.DataFrame([{"pid":d.pid, "time":d.time, "action":d.action} for d in decs])
-    fname = f"{setting.capitalize()}{run_date.strftime('%Y-%m-%d')}Decisions.csv"
-    df_decisions.to_csv(os.path.join(DECISIONS_SAVE_DIR, fname), index=False)
+
+    fname = f"{setting}_decisions.csv"  
+    df_decisions.to_csv(daily_dir / fname, index=False)
     

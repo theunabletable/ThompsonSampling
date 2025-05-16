@@ -21,7 +21,6 @@ class RoMEAgentManager(AgentManager):
     def __init__(self,
                  participants: list[str],
                  L_user: sparse.csr_matrix,
-                 user_cov: np.ndarray,
                  gamma_ridge: float,
                  lambda_penalty: float,
                  baseFeatureCols: list[str],          # ← main effects
@@ -54,9 +53,7 @@ class RoMEAgentManager(AgentManager):
         self.beta_const = self.zeta * max(1.0, np.log(self.K)**0.75)
         
         #user graph and ridge
-        self.L_user        = L_user
-        self.user_cov      = user_cov
-        self.user_precision= np.linalg.inv(user_cov)        
+        self.L_user        = L_user       
         self.gamma_ridge = gamma_ridge
         self.lambda_penalty = lambda_penalty
         
@@ -91,14 +88,16 @@ class RoMEAgentManager(AgentManager):
         I_p = sparse.identity(p, format = "csc", dtype = float)
         
         #shared block shape pxp
-        V_shared = I_p * 25. #Why 25?? Where should we get this??
+        V_shared = self.gamma_ridge * I_p # γ · I_p
         
-        ridge_block = sparse.kron(
-            sparse.identity(N, format="csc", dtype=float),
-            sparse.csc_matrix(self.user_precision) #user_precision here is how Easton does it, but the paper suggests it's just a constant gamma hyperparameter??
-        )
         
-        laplace_block = sparse.kron(self.L_user, I_p) * self.lambda_penalty
+        ridge_block = self.gamma_ridge * sparse.kron(
+        sparse.identity(N, format="csc"), I_p      # γ · I_{N·p}
+    )
+        ##ADD GAMMA IN HERE
+        
+        
+        laplace_block = sparse.kron(self.L_user, I_p) * self.lambda_penalty # λ · (L_user ⊗ I_p)
         
         V_user = ridge_block + laplace_block
         
@@ -132,8 +131,9 @@ class RoMEAgentManager(AgentManager):
         
         #convert to CSC for efficient arithmetic and cache it
         C_i = C_i.tocsc()
-        self._C_cache[pid] = C_i
-        return C_i
+        C_i_T = C_i.T.tocsc()
+        self._C_cache[pid] = (C_i, C_i_T)
+        return self._C_cache[pid]
     
     def compute_covariance_block(self, pid: str) -> np.ndarray:
         """
@@ -141,10 +141,9 @@ class RoMEAgentManager(AgentManager):
         Uses the CHOLMOD factor's call operator directly.
         """
         #selector matrix for this user
-        C_i = self._build_C_i(pid)  # shape: (p, total_dim)
+        C_i, C_i_T = self._build_C_i(pid)  # shape: (p, total_dim)
 
         #solve V * Vi_Ct = C_i^T  =>  Vi_Ct = V^{-1} * C_i^T
-        C_i_T = C_i.transpose().tocsc()
         Vi_Ct = self.V_chol(C_i_T)  # shape: (total_dim, p)
 
         #form the p×p covariance block: C_i @ (V^{-1} C_i^T)
@@ -251,15 +250,133 @@ class RoMEAgentManager(AgentManager):
         )
         return self._construct_phi_vector(x_d, pid)
     
+
     def update_posteriors(self, df_batch: pd.DataFrame) -> None:
         """
-        Update V and b using a batch of logged rows.  Assumes df_batch
-        has at least columns:
-            PARTICIPANTIDENTIFIER,  actionName,  rewardName,
-            and all feature columns needed by _transform_context_to_x_d.
-        Also assumes π (prob_no_send) was logged at decision time in
-            column 'pi_no_send'; if not present we recompute it.
+        Low-rank Cholesky updating version.
         """
+        if df_batch.empty:
+            return
+    
+        # ---------- 1) build Φ and weights in *one* pass -----------------
+        rows, cols, data = [], [], []
+        w_vec  = []          # σ̃²  (length n)
+        y_vec  = []          # σ̃² · r̃
+    
+        for k, (_, row) in enumerate(df_batch.iterrows()):
+            pid    = row['PARTICIPANTIDENTIFIER']
+            action = int(row[self.actionName])
+            reward = float(row[self.rewardName])
+    
+            # ----- π, σ̃², r̃ -------------------------------------------
+            if 'pi_no_send' in row:
+                pi_no = float(row['pi_no_send'])
+            else:
+                pi_no = self.agents[pid].probabilityOfSend(row)
+                pi_no = 1.0 - pi_no
+    
+            sigma_tilde2 = pi_no * (1.0 - pi_no)
+            denom        = (1.0 - pi_no) if action == SEND else -pi_no
+            r_tilde      = reward / denom
+    
+            # ----- Φ row ------------------------------------------------
+            phi          = self.make_phi(pid, row, action).tocoo()
+            rows.extend( np.full_like(phi.row, k) )
+            cols.extend( phi.col )
+            data.extend( phi.data )
+    
+            w_vec.append( sigma_tilde2 )
+            y_vec.append( sigma_tilde2 * r_tilde )
+    
+        n   = len(df_batch)
+        d   = (1 + self.N) * self.p
+        Phi = sparse.coo_matrix((data, (rows, cols)), shape=(n, d)).tocsr()
+    
+        W   = sparse.diags(w_vec)              # n×n
+        y   = np.array(y_vec)                  # length n
+    
+        # ---------- 2) accumulate V and b  ------------------------------
+        #   V ← V + Φᵀ W Φ
+        #   b ← b + Φᵀ y
+        # the first is low-rank (≤ n·p non-zeros), so use update_inplace
+        V_delta = Phi.T @ (W @ Phi)
+        b_delta = (Phi.T @ y).ravel()              # .A1 = 1-D ndarray
+    
+        # sparse.csc_matrix ensures CSC for CHOLMOD
+        V_delta = V_delta.tocsc()
+        self.V  = self.V + V_delta            # keep full Matrix for later
+    
+        # ---- 3) Cholesky rank-k update ---------------------------------
+        # CHOLMOD’s update_inplace needs L *L^T  +=  A  (here V_delta)
+        self.V_chol.update_inplace(V_delta)
+    
+        # ---- 4) mean term ----------------------------------------------
+        self.b += b_delta
+    
+        # ---- 5) reset caches so agents refresh on next call ------------
+        self._C_cache.clear()
+        for ag in self.agents.values():
+            ag.currentMean = None
+            ag.currentCov  = None
+
+
+'''
+    def update_posteriors(self, df_batch: pd.DataFrame) -> None:
+#        """
+#        One-pass IPW update using CHOLMOD's rank-1 update_inplace.
+#    
+#        df_batch must have columns
+#            PARTICIPANTIDENTIFIER, self.actionName, self.rewardName
+#            + all feature columns needed by _transform_context_to_x_d
+#        and optionally 'pi_no_send' (logged π_{i,t} on the NO_SEND arm).
+#        """
+        for _, row in df_batch.iterrows():
+            pid    = row['PARTICIPANTIDENTIFIER']
+            action = int(row[self.actionName])          # 0 / 1
+            reward = float(row[self.rewardName])
+    
+            # ---------- behaviour π_i,t (prob NO_SEND) ----------
+            if 'pi_no_send' in row:
+                pi_no = float(row['pi_no_send'])
+            else:
+                pi_no = 1.0 - self.agents[pid].probabilityOfSend(row)
+    
+            sigma_tilde2 = pi_no * (1.0 - pi_no)        # weight factor
+            denom = (1.0 - pi_no) if action == SEND else -pi_no
+            r_tilde = reward / denom                    # IPW pseudo-reward
+    
+            # ---------- feature vector --------------------------
+            phi = self.make_phi(pid, row, action).tocsr()   # 1 × d
+            w   = np.sqrt(sigma_tilde2)
+            phi_w = (w * phi).tocsr()                      # scale *data* only
+    
+            # ---------- rank-1  V  ←  V + φ_wᵀ φ_w -------------
+            #   update_inplace expects CSC & (d × 1)
+            self.V_chol.update_inplace(phi_w.T.tocsc())
+    
+            # ---------- b  ←  b + σ̃² · r̃ · φᵀ -----------------
+            self.b += sigma_tilde2 * r_tilde * phi.T.toarray().ravel()     #flat ndarray
+    
+        # Nothing else to do:  self.V_chol already current.
+        # If you still keep an explicit V for inspection, update it here:
+        #     self.V += phi_w.T @ phi_w   (inside the loop or accumulate)
+        self._C_cache.clear()               # invalidate cached C_i blocks
+        for ag in self.agents.values():     # force posterior refresh
+            ag.currentMean = None
+            ag.currentCov  = None
+
+'''            
+
+'''            
+    def update_posteriors(self, df_batch: pd.DataFrame) -> None:
+#        """
+#        Update V and b using a batch of logged rows.  Assumes df_batch
+#        has at least columns:
+#            PARTICIPANTIDENTIFIER,  actionName,  rewardName,
+#            and all feature columns needed by _transform_context_to_x_d.
+#        Also assumes π (prob_no_send) was logged at decision time in
+#            column 'pi_no_send'; if not present we recompute it.
+#        """
         V_add = sparse.csc_matrix(( (1+self.N)*self.p, (1+self.N)*self.p ), dtype=float)
         b_add = np.zeros( (1+self.N)*self.p )
         for _, row in df_batch.iterrows():
@@ -298,3 +415,5 @@ class RoMEAgentManager(AgentManager):
         for ag in self.agents.values():
             ag.currentMean = None        # force refresh
             ag.currentCov  = None
+            
+'''

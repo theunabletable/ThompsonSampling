@@ -1,20 +1,21 @@
-#config.py
 
 
 
-# config.py
-
-
-
+from pathlib import Path
 # --- File paths ---
 DF_EVENTS_PATH = "C:/Users/Drew/Desktop/JOB/2024 data/new dataframes/dfEventsThreeMonthsTimezones.csv"
 DF_HOURLY_PATH       = "data/dfHourly.csv"           # master hourly table
 DECISIONS_OUT_PATH   = "output/decisions_today.csv"  # daily send list
 
+BASE_DIR            = Path(r"C:\Users\Drew\Desktop\JOB\ThompsonSampling\Data")
+DECISIONS_SAVE_DIR  = BASE_DIR / "decisions"
 
-STEPS_MANAGER_PATH   = r"C:\Users\Drew\Desktop\JOB\ThompsonSampling\AgentSaves\StepsManagerPriors.pkl"    # pretrained steps agents
-SLEEP_MANAGER_PATH   = r"C:\Users\Drew\Desktop\JOB\ThompsonSampling\AgentSaves\SleepManagerPriors.pkl"
-MOOD_MANAGER_PATH    = r"C:\Users\Drew\Desktop\JOB\ThompsonSampling\AgentSaves\MoodManagerPriors.pkl"
+MODELS_CURRENT_DIR  = BASE_DIR / "models" / "current"
+MODELS_WEEKLY_DIR   = BASE_DIR / "models" / "weekly"
+
+STEPS_MANAGER_PATH  = MODELS_CURRENT_DIR / "stepsManager.pkl"
+SLEEP_MANAGER_PATH  = MODELS_CURRENT_DIR / "sleepManager.pkl"
+MOOD_MANAGER_PATH   = MODELS_CURRENT_DIR / "moodManager.pkl"
 
 STEPS_MANAGER_UPDATED_PATH = r"C:\Users\Drew\Desktop\JOB\ThompsonSampling\AgentSaves\StepsManagerUpdated.pkl"
 SLEEP_MANAGER_UPDATED_PATH = r"C:\Users\Drew\Desktop\JOB\ThompsonSampling\AgentSaves\SleepManagerUpdated.pkl"

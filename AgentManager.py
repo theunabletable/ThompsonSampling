@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+
 """
 This class implements an "AgentManager" object. The AgentManager for a particular reward-type is responsible for keeping the dictionary of agents,
 calling on those agents to perform actions, and assigning rewards to the agents which performed actions.

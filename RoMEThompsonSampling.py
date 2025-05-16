@@ -67,20 +67,21 @@ class RoMEThompsonSampling(ThompsonSampling):
     #advantage mean is the expected treatment effect of sending, and ths variance is needed for the advantage's distribution
     def _advantage_stats(self, context: pd.Series):
         """returns (mean, var) of advantage (send - no_send) """
-        m = self.manager
-        theta_hat = m.V_chol(m.b) #(1 + N)p vector
-        phi_send = m.make_phi(self.pid, context, SEND)
-        phi_no = m.make_phi(self.pid, context, NO_SEND)
-        phi_adv = phi_send - phi_no #sparse 1xd
-        
+        m              = self.manager
+        theta_hat      = m.V_chol(m.b)                            #(1 + N)p vector
+        phi_send       = m.make_phi(self.pid, context, SEND)
+        phi_no         = m.make_phi(self.pid, context, NO_SEND)
+        phi_adv        = (phi_send - phi_no).tocsc()              #sparse 1xd
+        phi_adv_T      = phi_adv.T.tocsc()
         #advantage mean, the treatment effect
         adv_mean = float(phi_adv @ theta_hat)
         
         #beta inflation factor
-        C_i = m._build_C_i(self.pid)
-        Vi_Ct = m.V_chol(C_i.T)
-        V_bar   = (C_i @ Vi_Ct).toarray()
-        Lambda  = (Vi_Ct.T @ m.V0 @ Vi_Ct).toarray()
+        C_i, C_i_T    = m._build_C_i(self.pid)
+        Vi_Ct         = m.V_chol(C_i_T)
+        V_bar         = (C_i @ Vi_Ct).toarray()
+        Lambda        = (Vi_Ct.T @ m.V0 @ Vi_Ct).toarray()
+        
         beta = m.v * np.sqrt(
             2 * np.log(2*m.K * (m.K + 1) / m.delta)
             + np.linalg.slogdet(V_bar)[1]   #why slogdet again??
@@ -88,7 +89,7 @@ class RoMEThompsonSampling(ThompsonSampling):
             ) + m.beta_const
         
         #variance phi V^-1 phi^T
-        base_var = (phi_adv @ m.V_chol(phi_adv.T)).A[0, 0]
+        base_var = (phi_adv @ m.V_chol(phi_adv_T)).A[0, 0]
         adv_var = base_var * (beta/m.first_beta) ** 2
         return adv_mean, adv_var
 
