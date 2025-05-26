@@ -62,37 +62,36 @@ class RoMEThompsonSampling(ThompsonSampling):
         self.currentMean = mu_i
         self.currentCov  = Sigma_i
 
-
-
-    def _advantage_stats(self, context: pd.Series) -> tuple[float, float]:
-        """
-        Mean and variance of the treatment advantage SEND − NO_SEND.
-
-        Notes
-        -----
-        Uses the manager's cached dense inverse to fetch only the
-        32×32 sub-matrix required for this user & feature set.
-        """
-        mgr          = self.manager
-
-        # --------- build sparse (1 × d) difference row
-        phi_send_vec = mgr.make_phi(self.pid, context, SEND)
-        phi_no_vec   = mgr.make_phi(self.pid, context, NO_SEND)
-        phi_vec      = (phi_send_vec - phi_no_vec).tocsc()
-
-        nz_idx       = phi_vec.indices           # 2p indices
-        phi_values   = phi_vec.data
-
-        # --------- mean  μ = φ θ_est
-        mu_adv  = float(phi_values @ mgr._theta_cache[nz_idx])
-
-        # --------- variance  σ² = φ V_inv φᵀ
-        Vinv_sub  = mgr.V_inv[np.ix_(nz_idx, nz_idx)]
-        base_var  = float(phi_values @ (Vinv_sub @ phi_values))
-
-        beta_i    = mgr._beta_cache[self.pid]
-        var_adv   = base_var * (beta_i / mgr.first_beta) ** 2
-        return mu_adv, var_adv
+        
+    #advantage features are phi(s, i) = phi(s, SEND, i) - phi(s, NO_SEND, i) and is the set of features which are different under send vs no_send
+    #advantage mean is the expected treatment effect of sending, and ths variance is needed for the advantage's distribution
+    def _advantage_stats(self, context: pd.Series):
+        """returns (mean, var) of advantage (send - no_send) """
+        m              = self.manager
+        theta_hat      = m.V_chol(m.b)                            #(1 + N)p vector
+        phi_send       = m.make_phi(self.pid, context, SEND)
+        phi_no         = m.make_phi(self.pid, context, NO_SEND)
+        phi_adv        = (phi_send - phi_no).tocsc()              #sparse 1xd
+        phi_adv_T      = phi_adv.T.tocsc()
+        #advantage mean, the treatment effect
+        adv_mean = float(phi_adv @ theta_hat)
+        
+        #beta inflation factor
+        C_i, C_i_T    = m._build_C_i(self.pid)
+        Vi_Ct         = m.V_chol(C_i_T)
+        V_bar         = (C_i @ Vi_Ct).toarray()
+        Lambda        = (Vi_Ct.T @ m.V0 @ Vi_Ct).toarray()
+        
+        beta = m.v * np.sqrt(
+            2 * np.log(2*m.K * (m.K + 1) / m.delta)
+            + np.linalg.slogdet(V_bar)[1]   #why slogdet again??
+            - np.linalg.slogdet(Lambda)[1]
+            ) + m.beta_const
+        
+        #variance phi V^-1 phi^T
+        base_var = (phi_adv @ m.V_chol(phi_adv_T)).A[0, 0]
+        adv_var = base_var * (beta/m.first_beta) ** 2
+        return adv_mean, adv_var
 
     def _clip(self, p):
         '''clipping helper'''
@@ -118,33 +117,3 @@ class RoMEThompsonSampling(ThompsonSampling):
         prob_send = 1.0 - prob_no_send
         action = NO_SEND if np.random.uniform() < prob_no_send else SEND
         return action
-    
-"""    
-    #advantage features are phi(s, i) = phi(s, SEND, i) - phi(s, NO_SEND, i) and is the set of features which are different under send vs no_send
-    #advantage mean is the expected treatment effect of sending, and ths variance is needed for the advantage's distribution
-    def _advantage_stats(self, context: pd.Series):
-#        returns (mean, var) of advantage (send - no_send) 
-        m              = self.manager
-        theta_hat      = m.V_chol(m.b)                            #(1 + N)p vector
-        #to be clear, V_chol(m.b) does -not- multiply V_chol by m.b. It uses the cholmod factor object's solve method, to solve Vx = b for x, that is, getting x = V^-1 b as desired.
-        phi_send       = m.make_phi(self.pid, context, SEND)
-        phi_no         = m.make_phi(self.pid, context, NO_SEND)
-        phi_adv        = (phi_send - phi_no).tocsc()              #sparse 1xd
-        phi_adv_T      = phi_adv.T.tocsc()
-        #advantage mean, the treatment effect
-        adv_mean = float(phi_adv @ theta_hat)
-        
-        #beta inflation factor
-        C_i, C_i_T    = m._build_C_i(self.pid)
-        Vi_Ct         = m.V_chol(C_i_T)
-        V_bar         = (C_i @ Vi_Ct).toarray()
-        Lambda        = (Vi_Ct.T @ m.V0 @ Vi_Ct).toarray()
-        
-        #caching beta saves lots of time in testing
-        beta = m._beta_cache[self.pid]
-        
-        #variance phi V^-1 phi^T
-        base_var = (phi_adv @ m.V_chol(phi_adv_T)).A[0, 0]
-        adv_var = base_var * (beta/m.first_beta) ** 2
-        return adv_mean, adv_var
-"""

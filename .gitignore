@@ -1,2 +1,4 @@
-Data/ 
+Data/
 AgentSaves/
+__pycache__/
+*.pyc

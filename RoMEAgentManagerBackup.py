@@ -72,42 +72,10 @@ class RoMEAgentManager(AgentManager):
         )
         #cache for selector matrices C_i
         self._C_cache = {}
-        self._beta_cache = {}
-        self._refresh_beta_cache()
-        self.agents = self._buildAgents()
-        self.V_inv            : np.ndarray | None = None   # set by _rebuild_dense
-        self._theta_cache : np.ndarray | None = None
         
-    
-    def _rebuild_dense_inverse(self) -> None:
-        """Refresh `V_inv`, `_theta_cache` and `_beta_cache`."""
-        dense_V        = self.V.toarray()
-        self.V_inv     = np.linalg.inv(dense_V)
-        self._theta_cache = self.V_inv @ self.b
-        self._refresh_beta_cache_dense()
-
-    # 3) dense β-cache (all ascii)
-    def _refresh_beta_cache_dense(self) -> None:
-        """Cheap closed-form β_i using blocks of `V_inv`."""
-        p          = self.p
-        log_term   = 2 * np.log(2*self.K*(self.K+1) / self.delta)
-        V_shared   = self.V_inv[:p, :p]
-        beta_dict  = {}
-        for i, pid in enumerate(self.participants):
-            blk   = p + i*p
-            V_user= self.V_inv[blk:blk+p, blk:blk+p]
-            V_su  = self.V_inv[:p, blk:blk+p]
-            V_bar = V_shared + V_su + V_su.T + V_user
-            V_iCt = np.vstack((V_shared+V_su, V_su.T+V_user))
-            lambda_mat = self.gamma_ridge * (V_iCt.T @ V_iCt)
-            beta_val = ( self.v *
-                         np.sqrt(log_term
-                                 + np.linalg.slogdet(V_bar)[1]
-                                 - np.linalg.slogdet(lambda_mat)[1])
-                         + self.beta_const )
-            beta_dict[pid] = float(beta_val)
-        self._beta_cache = beta_dict
-
+        self.agents = self._buildAgents()
+        
+        
     def _initialize_V0(self) -> sparse.csc_matrix:
         """
         V0 = block_diag([V_shared, V_user]) where:
@@ -281,160 +249,12 @@ class RoMEAgentManager(AgentManager):
             self.actionName,
         )
         return self._construct_phi_vector(x_d, pid)
-
-    
-    def update_posteriors(self, batch: pd.DataFrame) -> None:
-        """
-        Roll an IPW batch into the global posterior.
-    
-        Parameters
-        ----------
-        batch : pd.DataFrame
-            Must contain columns
-    
-            * PARTICIPANTIDENTIFIER
-            * ``self.actionName``  (0 ≡ NO_SEND, 1 ≡ SEND)
-            * ``self.rewardName``  (numeric reward)
-            * feature columns required by :py:meth:`make_phi`
-            * optionally ``pi_no_send`` logged at decision time.
-    
-        Notes
-        -----
-        Steps
-        1.  Build design matrix ``Phi`` (n × d), weight vector ``w`` and
-            pseudo-rewards ``y`` in one pass over the rows.
-        2.  Low-rank update::
-    
-                V_new = V + Phi.T @ diag(w) @ Phi
-                b_new = b + Phi.T @ y
-    
-            Both ``V`` and its sparse Cholesky factor are refreshed,
-            then a dense inverse is rebuilt for fast agent queries.
-        3.  Per-agent caches (`currentMean`, `currentCov`) are invalidated.
-        """
-        # --- refresh dense inverse & β-cache for current V -------------
-        self._rebuild_dense_inverse()
-        if batch.empty:
-            return
-    
-        # --- 1)  build Phi, w, y ---------------------------------------
-        row_idx, col_idx, values = [], [], []
-        w_list, y_list = [], []
-    
-        for k, (_, row) in enumerate(batch.iterrows()):
-            pid   = row["PARTICIPANTIDENTIFIER"]
-            act   = int(row[self.actionName])
-            rew   = float(row[self.rewardName])
-    
-            # behaviour policy  π(i,t)  (probability of NO_SEND)
-            pi_no = (row.get("pi_no_send")
-                     or 1.0 - self.agents[pid].probabilityOfSend(row))
-    
-            weight      = pi_no * (1.0 - pi_no)                # σ̃²
-            denom       = (1.0 - pi_no) if act == SEND else -pi_no
-            reward_tilt = rew / denom                          # r̃
-    
-            phi_row = self.make_phi(pid, row, act).tocoo()
-            row_idx.extend(np.full_like(phi_row.row, k))
-            col_idx.extend(phi_row.col)
-            values.extend(phi_row.data)
-    
-            w_list.append(weight)
-            y_list.append(weight * reward_tilt)
-    
-        n_rows = len(batch)
-        dim    = (1 + self.N) * self.p
-    
-        Phi = sparse.coo_matrix(
-            (values, (row_idx, col_idx)),
-            shape=(n_rows, dim)
-        ).tocsr()
-        W_diag = sparse.diags(w_list)
-        y_vec  = np.asarray(y_list)
-    
-        # --- 2)  precision & mean updates ------------------------------
-        V_delta = Phi.T @ (W_diag @ Phi)
-        b_delta = (Phi.T @ y_vec).ravel()
-    
-        self.V += V_delta.tocsc()
-        self.b += b_delta
-        self.V_chol = cholesky(self.V)          # ~6 s on 14k × 14k
-    
-        # rebuild dense inverse + β-cache (<< 1 s)
-        self._rebuild_dense_inverse()
-    
-        # --- 3)  clear per-agent caches --------------------------------
-        self._C_cache.clear()
-        for agent in self.agents.values():
-            agent.currentMean = None
-            agent.currentCov  = None
-
-
-
-    
-    #these have to be added because CHOLMOD can't be pickled
-    def __getstate__(self):
-        """
-        On pickling: drop the CHOLMOD factor (not pickleable).
-        It is cheap to recompute from V on reload.
-        """
-        state = self.__dict__.copy()
-        state["V_chol"] = None          # remove factor
-        return state
-    
-    def __setstate__(self, state):
-        """
-        On unpickling: restore instance dict and rebuild factor.
-        """
-        from sksparse.cholmod import cholesky   # local import avoids hard dep at top
-        self.__dict__.update(state)
-        # Rebuild sparse Cholesky factor in-place
-        self.V_chol = cholesky(self.V)
-        if "_beta_cache" not in self.__dict__:
-            self._beta_cache = {}
-        if not self._beta_cache:                # build if empty / stale
-            self._refresh_beta_cache()
-    
-    # Optional convenience wrappers ------------------------------------------
-    def save(self, path):
-        """Pickle self → *path* (now safe)."""
-        import pickle, gzip, pathlib
-        path = pathlib.Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with gzip.open(path, "wb") if path.suffix == ".gz" else open(path, "wb") as f:
-            pickle.dump(self, f)
-    
-    @classmethod
-    def load(cls, path):
-        """Inverse of save()."""
-        import pickle, gzip, pathlib
-        path = pathlib.Path(path)
-        with gzip.open(path, "rb") if path.suffix == ".gz" else open(path, "rb") as f:
-            obj = pickle.load(f)
-        return obj
     
 
-    def _refresh_beta_cache(self) -> None:
-        """Re-compute β_i for every participant given current V_chol."""
-        self._beta_cache.clear()
-        log_term = 2 * np.log(2 * self.K * (self.K + 1) / self.delta)
-        for pid in self.participants:
-            C_i, C_i_T = self._build_C_i(pid)
-            Vi_Ct      = self.V_chol(C_i_T)           # solve   V X = C_iᵀ
-            V_bar      = (C_i @ Vi_Ct).toarray()
-            Lambda     = (Vi_Ct.T @ self.V0 @ Vi_Ct).toarray()
-            beta_i = (
-                self.v * np.sqrt(log_term
-                                 + np.linalg.slogdet(V_bar)[1]
-                                 - np.linalg.slogdet(Lambda)[1])
-                + self.beta_const
-            )
-            self._beta_cache[pid] = float(beta_i)
-
-
-
-'''
     def update_posteriors(self, df_batch: pd.DataFrame) -> None:
+        """
+        Low-rank Cholesky updating version.
+        """
         if df_batch.empty:
             return
     
@@ -500,8 +320,7 @@ class RoMEAgentManager(AgentManager):
             ag.currentCov  = None
 
 
-
-
+'''
     def update_posteriors(self, df_batch: pd.DataFrame) -> None:
 #        """
 #        One-pass IPW update using CHOLMOD's rank-1 update_inplace.
