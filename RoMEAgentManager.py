@@ -361,7 +361,7 @@ class RoMEAgentManager(AgentManager):
         self.V_chol = cholesky(self.V)          # ~6 s on 14k × 14k
     
         # rebuild dense inverse + β-cache (<< 1 s)
-        self._rebuild_dense_inverse()
+        #self._rebuild_dense_inverse()
     
         # --- 3)  clear per-agent caches --------------------------------
         self._C_cache.clear()
